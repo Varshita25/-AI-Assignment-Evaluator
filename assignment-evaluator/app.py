@@ -22,6 +22,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.backends.backend_pdf import PdfPages
+import time
 
 # Load environment variables
 load_dotenv()
@@ -35,26 +36,42 @@ st.set_page_config(
 )
 
 # Azure OpenAI Configuration
-ENDPOINT = "https://varshitharesource.services.ai.azure.com/openai/v1/"
-MODEL_NAME = "gpt-oss-120b"
-DEPLOYMENT_NAME = "gpt-oss-120b"
+# Read from environment with sensible defaults (user can override in .env)
+ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://varshitharesource.services.ai.azure.com/").rstrip('/')
+if not ENDPOINT.endswith('/openai/v1'):
+    ENDPOINT = ENDPOINT.rstrip('/') + '/openai/v1/'
+MODEL_NAME = os.getenv("AZURE_OPENAI_MODEL", "gpt-oss-120b")
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-oss-120b")
 
 # Initialize session state
 if 'evaluation_results' not in st.session_state:
     st.session_state.evaluation_results = []
 if 'api_key' not in st.session_state:
     st.session_state.api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = False
 
 def configure_azure_openai(api_key):
     """Configure Azure OpenAI with the provided key"""
+    if not api_key or api_key.strip() == "":
+        st.error("🔑 **API Key Missing**: Please set AZURE_OPENAI_API_KEY in your `.env` file")
+        return None
+    
     try:
+        # Validate endpoint format
+        if not ENDPOINT.startswith("http"):
+            st.error(f"❌ **Invalid Endpoint**: {ENDPOINT} is not a valid URL")
+            return None
+        
         client = OpenAI(
             base_url=ENDPOINT,
-            api_key=api_key
+            api_key=api_key,
+            timeout=30.0  # Add explicit timeout
         )
         return client
     except Exception as e:
-        st.error(f"Error configuring Azure OpenAI: {str(e)}")
+        err_msg = str(e)
+        st.error(f"❌ **Error configuring Azure OpenAI**: {err_msg}\n\n**Debug Info:**\n- Endpoint: {ENDPOINT}\n- API Key Present: {'Yes' if api_key else 'No'}")
         return None
 
 def extract_text_from_file(file, file_type):
@@ -311,25 +328,57 @@ Respond with a detailed evaluation in the following JSON format:
 IMPORTANT: Base your evaluation entirely on what the question paper specifically asks for. Different assignments should have different evaluation criteria based on their unique requirements.
 """
     
-    try:
-        completion = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert academic evaluator. Analyze the provided file content thoroughly and provide comprehensive, fair evaluations."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.3,
-            max_tokens=4000
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error during AI evaluation: {str(e)}"
+    # Defensive check
+    if not client:
+        return "Error during AI evaluation: AI client not configured. Please set your AZURE_OPENAI_API_KEY in the environment."
+
+    # Attempt the API call with a small retry/backoff in case of transient network issues
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            completion = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert academic evaluator. Analyze the provided file content thoroughly and provide comprehensive, fair evaluations."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=4000
+            )
+
+            # Some clients return different shapes; be defensive when reading the content
+            try:
+                return completion.choices[0].message.content
+            except Exception:
+                # Fallback for different SDK response shapes
+                return getattr(completion, 'text', str(completion))
+
+        except Exception as e:
+            err_str = str(e)
+            # Log debug info
+            import sys
+            print(f"DEBUG [Attempt {attempt}/{max_attempts}] Error: {err_str}", file=sys.stderr)
+            print(f"DEBUG Endpoint: {ENDPOINT}, Model: {DEPLOYMENT_NAME}", file=sys.stderr)
+            
+            # If this was a transient network problem, retry with backoff
+            if attempt < max_attempts:
+                wait = 2 ** attempt
+                time.sleep(wait)
+                continue
+            # Final attempt failed: give a helpful message
+            # Distinguish connection-like errors vs auth/errors from the service
+            if 'Connection' in err_str or 'ConnectionError' in err_str or 'timeout' in err_str.lower() or 'refused' in err_str.lower():
+                return f"Error during AI evaluation: Connection error. Check your network, endpoint URL '{ENDPOINT}', and API key. Details: {err_str}"
+            elif '401' in err_str or 'Unauthorized' in err_str or 'api key' in err_str.lower():
+                return f"Error during AI evaluation: Authentication error. Check your AZURE_OPENAI_API_KEY and deployment configuration. Details: {err_str}"
+            else:
+                return f"Error during AI evaluation: {err_str}"
 
 def process_multiple_files(uploaded_files, question_paper, client, evaluation_criteria):
     """Process multiple assignment files by sending them directly to AI"""
@@ -879,9 +928,30 @@ root.destroy()
     # Main content area - Evaluation Process
     if not client:
         st.error("🔑 **API Configuration Required**")
-        st.markdown("Please add your Azure OpenAI API key to the `.env` file:")
-        st.code("AZURE_OPENAI_API_KEY=your_api_key_here")
-        st.markdown("Then restart the application.")
+        st.markdown("""
+### Configuration Steps:
+
+1. **Get your Azure OpenAI credentials:**
+   - Azure Endpoint: `https://your-resource.openai.azure.com/`
+   - API Key: Available from Azure Portal
+   - Model/Deployment Name: Your deployed model name
+
+2. **Update your `.env` file:**
+   ```
+   AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+   AZURE_OPENAI_API_KEY=your_api_key_here
+   AZURE_OPENAI_MODEL=gpt-4
+   AZURE_OPENAI_DEPLOYMENT=your-deployment-name
+   ```
+
+3. **Restart the application** after updating the `.env` file.
+
+**Troubleshooting:**
+- Check that your endpoint URL is correct (should start with `https://`)
+- Verify your API key is valid and not expired
+- Ensure your resource name in the endpoint matches your Azure resource
+- If using a different model, update the `AZURE_OPENAI_MODEL` and `AZURE_OPENAI_DEPLOYMENT` values
+        """)
         return
     
     # Evaluation Process
